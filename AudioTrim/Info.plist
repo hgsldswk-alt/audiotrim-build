@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleDisplayName</key><string>音频快剪</string>
+    <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
+    <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>APP_STORE_ID</key><string>$(APP_STORE_ID)</string>
+    <key>AudioTrimProProductID</key><string>$(APP_ID).pro</string>
+    <key>AudioTrimTrialProductID</key><string>$(APP_ID).trial</string>
+    <key>UILaunchScreen</key><dict/>
+    <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+    <key>ITSAppUsesNonExemptEncryption</key><false/>
+    <key>NSMicrophoneUsageDescription</key><string>仅在你开始录音时使用麦克风，录音保存在本机。</string>
+    <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Audio and Video</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.audio</string><string>public.movie</string><string>public.video</string>
+                <string>public.mp3</string><string>public.mpeg-4-audio</string><string>public.aac-audio</string>
+                <string>com.microsoft.waveform-audio</string><string>com.apple.quicktime-movie</string>
+                <string>public.mpeg-4</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Audio Trim Selection</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Owner</string>
+            <key>LSItemContentTypes</key><array><string>com.hgsldswk.audiotrim.selection</string></array>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.hgsldswk.audiotrim.selection</string>
+            <key>UTTypeConformsTo</key><array><string>public.json</string><string>public.content</string></array>
+            <key>UTTypeDescription</key><string>Audio Trim Selection</string>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key><array><string>audioclip</string></array>
+                <key>public.mime-type</key><string>application/vnd.audiotrim.selection+json</string>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>
