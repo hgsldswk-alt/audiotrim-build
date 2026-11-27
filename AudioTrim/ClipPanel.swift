@@ -1,0 +1,487 @@
+import StoreKit
+import SwiftUI
+import UIKit
+
+@MainActor
+struct ClipPanel: View {
+    let panel: ClipController.Panel
+    @ObservedObject var model: ClipController
+    @ObservedObject var audio: LocalAudio
+    @Environment(\.requestReview) private var requestReview
+    @State private var start = ""
+    @State private var end = ""
+    @State private var token = ""
+    @State private var cut: Double = 0
+    @State private var batch: Set<UUID> = []
+    @State private var format = ExportFormat.m4a
+    @State private var toDelete: Draft?
+    @State private var fileToDelete: ExportRecord?
+    @State private var invalid = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                if panel == .card {
+                    Button { if let record = model.result { Task { await model.present(record, milestone: model.milestone) } } } label: {
+                        Image(systemName: "chevron.left").frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel(L.t("result.title"))
+                    .accessibilityIdentifier("card.back")
+                }
+                Text(L.t(title))
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier(panel.rawValue + ".title")
+                if panel != .recording {
+                    Button {
+                        if panel == .importSelection { model.clearCode() }
+                        model.panel = nil
+                    } label: {
+                        Text(L.t("common.close")).frame(minHeight: 44).contentShape(Rectangle())
+                    }
+                    .accessibilityIdentifier(panel.rawValue + ".close")
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 15) { content }
+                    .frame(maxWidth: 570, alignment: .leading)
+                    .padding(20)
+                    .frame(maxWidth: .infinity)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .disabled(model.working)
+            if panel == .card, let artwork {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) { cardActions(artwork) }
+                    VStack(spacing: 8) { cardActions(artwork) }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+            }
+            if model.working { ProgressView().padding(12) }
+            if let message = model.notice {
+                Text(message).font(.footnote).foregroundStyle(.secondary)
+                    .padding(10)
+                    .task(id: message) {
+                        do { try await Task.sleep(nanoseconds: 2_200_000_000) } catch { return }
+                        if model.notice == message { model.notice = nil }
+                    }
+            }
+        }
+        .background(ClipTheme.paper.ignoresSafeArea())
+        .tint(ClipTheme.accent)
+        .interactiveDismissDisabled(panel == .recording || model.working)
+        .modifier(FailureAlert(model: model, presented: true))
+        .fileImporter(isPresented: Binding(get: { panel == .importSelection && model.pickerShown },
+                                           set: { if panel == .importSelection { model.pickerShown = $0 } }),
+                      allowedContentTypes: model.selectedTypes, allowsMultipleSelection: false, onCompletion: model.picked)
+        .task {
+            if let draft = model.draft, let source = model.source {
+                start = ClipClock.display(draft.selection.start, rate: source.rate)
+                end = ClipClock.display(draft.selection.end, rate: source.rate)
+                cut = Double(model.playhead ?? (draft.selection.start + draft.selection.count / 2))
+            }
+            if panel == .storage { await model.loadStorage() }
+        }
+        .onDisappear { if panel == .importSelection && model.panel != .importSelection { model.clearCode() } }
+    }
+
+    private var title: String {
+        switch panel {
+        case .settings: return "settings.title"
+        case .storage: return "storage.title"
+        case .recording: return "recording.active"
+        case .time: return "time.title"
+        case .format: return "export.format"
+        case .split: return "split.title"
+        case .batch: return "home.batch"
+        case .tasks: return "jobs.title"
+        case .result: return "result.title"
+        case .history: return "history.title"
+        case .card: return "card.title"
+        case .shareSelection: return "code.share"
+        case .importSelection: return "code.import"
+        case .privacy: return "privacy.title"
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch panel {
+        case .settings: settings
+        case .storage: storage
+        case .recording: recording
+        case .time: time
+        case .format: formats
+        case .split: split
+        case .batch: batches
+        case .tasks: jobs
+        case .history: history
+        case .result: result
+        case .card: card
+        case .shareSelection: shareSelection
+        case .importSelection: importSelection
+        case .privacy: Text(L.t("privacy.body")).font(.body)
+        }
+    }
+
+    private var settings: some View {
+        VStack(spacing: 10) {
+            ClipButton(key: "storage.title", icon: "internaldrive", id: "settings.storage") { model.show(.storage) }
+            ClipButton(key: "settings.recommend", icon: "square.and.arrow.up", id: "settings.recommend", action: model.recommend)
+            ClipButton(key: "settings.rate", icon: "star", id: "settings.rate") { requestReview() }
+            ClipButton(key: "privacy.title", icon: "hand.raised", id: "settings.privacy") { model.show(.privacy) }
+        }
+    }
+
+    private var storage: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            Text(L.t("storage.detail")).font(.footnote).foregroundStyle(.secondary)
+            if model.drafts.isEmpty { Text(L.t("storage.empty")).foregroundStyle(.secondary) }
+            ForEach(model.state.sources) { source in
+                VStack(alignment: .leading, spacing: 9) {
+                    Text(source.title).font(.headline)
+                    Text(ByteCountFormatter.string(fromByteCount: model.sourceSizes[source.id] ?? source.bytes, countStyle: .file))
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(model.drafts.filter { $0.sourceID == source.id }) { draft in
+                        Button(role: .destructive) { toDelete = draft } label: {
+                            Label(L.f("storage.deleteDraftAt", draft.updatedAt.formatted(date: .abbreviated, time: .shortened)),
+                                  systemImage: "trash")
+                        }
+                        .accessibilityIdentifier("storage.draft.\(draft.id)")
+                        .frame(minHeight: 44)
+                    }
+                    ForEach(model.state.records.filter { $0.spec.sourceID == source.id && model.availableRecords.contains($0.id) }) { record in
+                        Button(role: .destructive) { fileToDelete = record } label: {
+                            Text(L.f("storage.deleteFileAt", record.fileName,
+                                     ByteCountFormatter.string(fromByteCount: record.bytes, countStyle: .file)))
+                                .multilineTextAlignment(.leading)
+                                .frame(minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityIdentifier("storage.file.\(record.id)")
+                    }
+                }
+                Divider()
+            }
+        }
+        .confirmationDialog(L.t("storage.confirm"), isPresented: Binding(
+            get: { toDelete != nil || fileToDelete != nil },
+            set: { if !$0 { toDelete = nil; fileToDelete = nil } }
+        ), titleVisibility: .visible) {
+            Button(L.t("common.delete"), role: .destructive) {
+                if let draft = toDelete { model.delete(draft) }
+                else if let record = fileToDelete { model.delete(record) }
+                toDelete = nil
+                fileToDelete = nil
+            }.accessibilityIdentifier("storage.confirmDelete")
+        }
+    }
+
+    private var recording: some View {
+        VStack(spacing: 18) {
+            Text(ClipClock.display(Int64(audio.elapsed * 1000), rate: 1000))
+                .font(.largeTitle.monospacedDigit().weight(.bold))
+                .accessibilityIdentifier("record.timer")
+            ClipButton(key: "recording.stop", icon: "stop.fill", id: "record.stop", primary: true, action: model.stopRecording)
+        }.frame(maxWidth: .infinity)
+    }
+
+    private var time: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(L.t("time.hint")).font(.footnote).foregroundStyle(.secondary)
+            Text(L.t("editor.start")).font(.subheadline)
+            TextField(L.t("editor.start"), text: $start)
+                .textFieldStyle(.roundedBorder).font(.body.monospacedDigit()).accessibilityIdentifier("time.start")
+                .onChange(of: start) { _, _ in invalid = false }
+            Text(L.t("editor.end")).font(.subheadline)
+            TextField(L.t("editor.end"), text: $end)
+                .textFieldStyle(.roundedBorder).font(.body.monospacedDigit()).accessibilityIdentifier("time.end")
+                .onChange(of: end) { _, _ in invalid = false }
+            if invalid {
+                Text(L.t("time.invalid")).font(.footnote).foregroundStyle(.red).accessibilityIdentifier("time.invalid")
+            }
+            ClipButton(key: "common.apply", icon: "checkmark", id: "time.apply", primary: true) {
+                guard let source = model.source, let first = ClipClock.parse(start, rate: source.rate),
+                      let last = ClipClock.parse(end, rate: source.rate) else { invalid = true; return }
+                let range = FrameRange(start: first, end: min(last, source.frames))
+                let roundedDuration = ClipClock.display(source.frames, rate: source.rate)
+                guard (last <= source.frames || end == roundedDuration),
+                      range.isValid(total: source.frames, rate: source.rate) else { invalid = true; return }
+                model.setRange(range)
+                model.panel = nil
+            }
+        }
+    }
+
+    private var formats: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if Launch.freePeriod {
+                Text(L.t("export.formatDetail")).font(.footnote).foregroundStyle(.secondary)
+            }
+            Picker(L.t("export.fade"), selection: $model.fadeSeconds) {
+                ForEach(ExportFade.choices, id: \.self) { s in
+                    Text(s == 0 ? L.t("export.fadeOff") : "\(Int(s)) s").tag(s)
+                }
+            }
+            .pickerStyle(.menu)
+            .accessibilityIdentifier("export.fade")
+            ClipButton(key: "export.m4a", icon: "arrow.down.to.line", id: "format.m4a") { model.export(.m4a) }
+            if Launch.freePeriod {
+                ClipButton(key: "export.wav", icon: "arrow.down.to.line", id: "format.wav", primary: true) { model.export(.wav) }
+                Text("WAV / 16-bit PCM").font(.caption.monospaced()).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private var split: some View {
+        if let draft = model.draft, let source = model.source {
+            let active = draft.cuts.filter { $0 > draft.selection.start && $0 < draft.selection.end }
+            let segments = draft.selection.segments(cuts: active, total: source.frames, rate: source.rate)
+            Text(L.t("split.hint")).font(.footnote).foregroundStyle(.secondary)
+            Slider(value: $cut, in: Double(draft.selection.start)...Double(draft.selection.end), step: 1)
+                .accessibilityLabel(L.t("split.position"))
+                .accessibilityValue(ClipClock.display(Int64(cut), rate: source.rate))
+                .accessibilityIdentifier("split.position")
+            Text(ClipClock.display(Int64(cut), rate: source.rate)).font(.body.monospacedDigit())
+            ClipButton(key: "split.add", icon: "plus", id: "split.add") {
+                invalid = !model.addCut(Int64(cut))
+            }
+            if invalid { Text(L.t("split.invalid")).font(.footnote).foregroundStyle(.red) }
+            ForEach(draft.cuts, id: \.self) { frame in
+                HStack {
+                    Text(ClipClock.display(frame, rate: source.rate)).monospacedDigit()
+                    Spacer()
+                    Button(role: .destructive) { model.removeCut(frame); invalid = false } label: {
+                        Image(systemName: "trash").frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel(L.t("common.delete"))
+                    .accessibilityIdentifier("split.remove.\(frame)")
+                }
+            }
+            if let segments {
+                ForEach(Array(segments.enumerated()), id: \.offset) { index, range in
+                    Button { model.preview(range: range) } label: {
+                        Text(L.f("split.preview", index + 1)).frame(minHeight: 44).contentShape(Rectangle())
+                    }
+                        .accessibilityIdentifier("split.preview.\(index)")
+                }
+            }
+            formatPicker("split.format")
+            Button {
+                if let segments { model.export(format, segments: segments) }
+            } label: {
+                Text(L.f("split.export", segments?.count ?? 0)).frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(segments == nil)
+            .accessibilityIdentifier("split.export")
+        }
+    }
+
+    private var batches: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text(L.t("batch.hint")).font(.footnote).foregroundStyle(.secondary)
+            ForEach(model.drafts) { item in
+                if let source = model.state.source(for: item) {
+                    Button {
+                        if !batch.removeIfPresent(item.id), batch.count < 10 { batch.insert(item.id) }
+                    } label: {
+                        HStack {
+                            Image(systemName: batch.contains(item.id) ? "checkmark.circle.fill" : "circle")
+                            Text(source.title).foregroundStyle(Color.primary)
+                            Spacer()
+                            Text(ClipClock.display(item.selection.count, rate: source.rate))
+                                .font(.caption.monospaced()).foregroundStyle(.secondary)
+                        }.frame(minHeight: 44)
+                    }
+                    .accessibilityAddTraits(batch.contains(item.id) ? [.isSelected] : [])
+                    .accessibilityIdentifier("batch.draft.\(item.id)")
+                    Divider()
+                }
+            }
+            formatPicker("batch.format")
+            Button {
+                model.export(format, selected: model.drafts.filter { batch.contains($0.id) })
+            } label: {
+                Text(L.f("batch.export", batch.count)).frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(batch.isEmpty)
+            .accessibilityIdentifier("batch.export")
+        }
+    }
+
+    private func formatPicker(_ id: String) -> some View {
+        Picker(L.t("export.format"), selection: $format) {
+            ForEach(ExportFormat.allCases, id: \.self) { value in Text(value.title).tag(value) }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier(id)
+    }
+
+    private var jobs: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if model.state.jobs.isEmpty { Text(L.t("jobs.empty")).foregroundStyle(.secondary) }
+            ForEach(model.state.jobs) { job in
+                ForEach(job.items) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.fileName).font(.subheadline.weight(.semibold))
+                        if let record = model.state.records.first(where: { $0.id == item.id }),
+                           model.availableRecords.contains(record.id) {
+                            Button { Task { await model.present(record) } } label: {
+                                Text(L.t("result.open")).frame(minHeight: 44).contentShape(Rectangle())
+                            }
+                                .accessibilityIdentifier("job.open.\(item.id)")
+                        } else {
+                            if let issue = item.failure { Text(L.t(issue.messageKey)).font(.caption).foregroundStyle(.secondary) }
+                            Button { model.retry(job, item: item) } label: {
+                                Text(L.t("jobs.retry")).frame(minHeight: 44).contentShape(Rectangle())
+                            }
+                                .accessibilityIdentifier("job.retry.\(item.id)")
+                        }
+                    }
+                }
+                ClipButton(key: "jobs.retryAll", icon: "arrow.clockwise", id: "job.all.\(job.id)") { model.retry(job) }
+                Divider()
+            }
+        }
+    }
+
+    private var history: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(model.history) { record in
+                if record.spec.merge == nil, let source = model.source {
+                    Text(L.f("history.range", ClipClock.display(record.spec.selection.start, rate: source.rate),
+                             ClipClock.display(record.spec.selection.end, rate: source.rate)))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Button {
+                    if model.availableRecords.contains(record.id) { Task { await model.present(record) } }
+                    else { model.rebuild(record) }
+                } label: {
+                    Text(record.fileName).frame(minHeight: 44).contentShape(Rectangle())
+                }.accessibilityIdentifier("history.file.\(record.id)")
+                if !model.availableRecords.contains(record.id) { Text(L.t("history.rebuild")).font(.footnote) }
+                Divider()
+            }
+        }
+    }
+
+    @ViewBuilder private var result: some View {
+        if let record = model.result {
+            exportSummary(record)
+            ClipButton(key: "result.share", icon: "square.and.arrow.up", id: "result.share", primary: true) {
+                model.shareAudio(record)
+            }
+            if record.spec.merge == nil {
+                ClipButton(key: model.milestone == nil ? "card.open" : "card.milestone",
+                           icon: "rectangle.portrait", id: "result.card") { model.show(.card) }
+            }
+            if model.milestone != nil {
+                Button { model.hideMilestone() } label: {
+                    Text(L.t("result.dismissMilestone")).frame(minHeight: 44).contentShape(Rectangle())
+                }
+                    .accessibilityIdentifier("result.dismissMilestone")
+            }
+        }
+    }
+
+    private func exportSummary(_ record: ExportRecord) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(L.f("result.saved", record.spec.format.title)).font(.title2.weight(.bold))
+                .accessibilityIdentifier("result.saved")
+            Text(record.fileName).font(.subheadline).foregroundStyle(.secondary)
+            let seconds = record.spec.merge == nil
+                ? Double(record.spec.selection.count) / Double(model.resultSource?.rate ?? 48000) : record.seconds
+            Text(L.f("result.duration", L.number(seconds, decimals: 2))).font(.footnote).foregroundStyle(.secondary)
+            ClipButton(key: audio.playing == record.id.uuidString ? "play.pause" : "result.preview",
+                       icon: audio.playing == record.id.uuidString ? "pause.fill" : "play.fill", id: "result.preview") {
+                model.preview(record)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay { RoundedRectangle(cornerRadius: 13).strokeBorder(ClipTheme.outline).allowsHitTesting(false) }
+    }
+
+    private var artwork: ShareArtwork? {
+        guard let record = model.result, let source = model.resultSource else { return nil }
+        return ShareArtwork(record: record, source: source, peaks: model.cardPeaks, milestone: model.milestone)
+    }
+
+    @ViewBuilder private var card: some View {
+        if let record = model.result, let artwork {
+            exportSummary(record)
+            artwork.preview
+                .accessibilityIdentifier("card.preview")
+            Text(L.t("card.topic")).font(.headline)
+            Text(artwork.topic).font(.subheadline).foregroundStyle(ClipTheme.accent)
+            Text(L.t("card.privacy")).font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    private func cardActions(_ artwork: ShareArtwork) -> some View {
+        Group {
+            ClipButton(key: "card.share", icon: "square.and.arrow.up", id: "card.share", primary: true) {
+                if let data = artwork.png() { model.shareCard(data) }
+                else { model.failure = .export }
+            }
+            ClipButton(key: "card.copy", icon: "doc.on.doc", id: "card.copy") {
+                UIPasteboard.general.string = artwork.topic
+                model.notice = L.t("card.copied")
+            }
+        }
+    }
+
+    private var shareSelection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(L.t("code.privacy")).font(.subheadline).foregroundStyle(.secondary)
+            ClipButton(key: "code.file", icon: "doc", id: "code.shareFile", primary: true, action: model.shareSelection)
+            ClipButton(key: "code.copy", icon: "doc.on.doc", id: "code.copy", action: model.copyCode)
+        }
+    }
+
+    private var importSelection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let code = model.code {
+                Text(L.f("history.range", ClipClock.display(code.start, rate: code.timescale),
+                         ClipClock.display(code.end, rate: code.timescale)))
+                    .font(.body.monospacedDigit())
+                    .accessibilityIdentifier("code.range")
+                if let source = model.codeSource {
+                    Text(source.title).font(.headline)
+                    Text(L.t("code.newDraft")).font(.footnote).foregroundStyle(.secondary)
+                    ClipButton(key: "common.apply", icon: "checkmark", id: "code.apply", primary: true, action: model.applyCode)
+                } else {
+                    Text(L.t("code.needSource")).font(.footnote).foregroundStyle(.secondary)
+                    ClipButton(key: "code.chooseSource", icon: "doc", id: "code.chooseSource", primary: true) {
+                        model.select(.audioOrVideo, codeSource: true)
+                    }
+                }
+            } else {
+                Text(L.t("code.pasteHint")).font(.subheadline).foregroundStyle(.secondary)
+                TextField(L.t("code.input"), text: $token, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .lineLimit(2...5)
+                    .accessibilityIdentifier("code.input")
+                PasteButton(payloadType: String.self) { if let value = $0.first { model.importCode(value) } }
+                    .accessibilityIdentifier("code.paste")
+                ClipButton(key: "code.validate", icon: "checkmark", id: "code.validate", primary: true) {
+                    model.importCode(token)
+                }.disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                ClipButton(key: "code.openFile", icon: "doc", id: "code.openFile") { model.select(.selection) }
+            }
+        }
+    }
+}
+
+private extension Set {
+    mutating func removeIfPresent(_ value: Element) -> Bool { remove(value) != nil }
+}

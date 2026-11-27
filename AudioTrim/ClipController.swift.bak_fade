@@ -1,0 +1,812 @@
+import AVFoundation
+import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
+
+@MainActor
+final class ClipController: ObservableObject {
+    enum Panel: String, Identifiable {
+        case settings, storage, recording, time, format, split, batch, tasks, result, history
+        case card, shareSelection, importSelection, privacy
+        var id: String { rawValue }
+    }
+
+    enum Picker { case audio, video, audioOrVideo, selection, merge }
+    struct Activity: Identifiable {
+        let id = UUID()
+        let url: URL
+        let countsForReview: Bool
+    }
+    private struct Incoming {
+        let url: URL
+        let kind: SourceKind
+        let displayName: String?
+        let access: Bool
+    }
+    private struct ImportBatch {
+        var items: [Incoming]
+        var merge = false
+        var sharedFolder: URL? = nil
+    }
+
+    struct MergeClip: Identifiable {
+        let id = UUID()
+        let draftID: UUID
+        let source: SourceAsset
+        let name: String
+    }
+
+    @Published private(set) var state = LibraryState()
+    @Published private(set) var draft: Draft?
+    @Published private(set) var peaks: WavePeaks?
+    @Published private(set) var availableRecords: Set<UUID> = []
+    @Published private(set) var ready = false
+    @Published private(set) var unavailable = false
+    @Published private(set) var working = false
+    @Published private(set) var preparingRecording = false
+    @Published private(set) var playhead: Int64?
+    @Published private(set) var undo: FrameRange?
+    @Published private(set) var result: ExportRecord?
+    @Published private(set) var milestone: Milestone?
+    @Published private(set) var code: SelectionCode?
+    @Published private(set) var codeSource: SourceAsset?
+    @Published private(set) var sourceSizes: [UUID: Int64] = [:]
+    @Published private(set) var mergeClips: [MergeClip]? = nil
+    @Published var mergeGap = MergeGap.none
+    @Published var panel: Panel?
+    @Published var activity: Activity?
+    @Published var failure: ClipFailure?
+    @Published var notice: String?
+    @Published var pickerShown = false
+    @Published var picker = Picker.audio
+
+    let audio = LocalAudio()
+    let simulated: Bool
+    let microphoneDenied: Bool
+    private let library: MediaLibrary
+    private let root: URL
+    private let cache: URL
+    private let arguments = ProcessInfo.processInfo.arguments
+    private var incoming: [ImportBatch] = []
+    private var failedImport: ImportBatch?
+    private var queuedShares = Set<URL>()
+    private var saveTask: Task<Void, Never>?
+    private var waveTask: Task<Void, Never>?
+    private var operation: Task<Void, Never>?
+    private var nextPanel: Panel?
+    private var booting = false
+    private var importingCodeSource = false
+    private var originalReviewRange: FrameRange?
+    private var reviewEarliest = Date.distantPast
+    private var reviewAfterShareNeedsHome = false
+    private var resultPeaks: WavePeaks?
+    private var backgroundTask = UIBackgroundTaskIdentifier.invalid
+
+    var source: SourceAsset? { draft.flatMap { state.source(for: $0) } }
+    var drafts: [Draft] { state.drafts.sorted { $0.updatedAt > $1.updatedAt } }
+    var history: [ExportRecord] { state.records.filter { $0.spec.draftID == draft?.id }.sorted { $0.createdAt > $1.createdAt } }
+    var cardPeaks: [Double] {
+        guard let range = result?.spec.selection else { return [] }
+        return resultPeaks?.values(in: range, bars: 88) ?? []
+    }
+    var resultSource: SourceAsset? { state.sources.first { $0.id == result?.spec.sourceID } }
+    var selectedTypes: [UTType] {
+        switch picker {
+        case .audio, .merge: return [.audio]
+        case .video: return [.movie, .video]
+        case .audioOrVideo: return [.audio, .movie, .video]
+        case .selection: return [UTType(exportedAs: SelectionCode.typeIdentifier, conformingTo: .json)]
+        }
+    }
+    var pickerAllowsMultiple: Bool { Launch.freePeriod && (picker == .audio || picker == .merge) }
+    var idleHome: Bool {
+        ready && !unavailable && draft == nil && mergeClips == nil && panel == nil && !working && !pickerShown && activity == nil
+            && failure == nil && notice == nil && !audio.recording && !audio.interrupted
+    }
+
+    init() {
+        #if DEBUG
+        simulated = arguments.contains("-ui-testing")
+        #else
+        simulated = false
+        #endif
+        microphoneDenied = simulated && arguments.contains("-mic-denied")
+        let manager = FileManager.default
+        if simulated {
+            let token = ProcessInfo.processInfo.environment["AUDIOTRIM_TEST_SANDBOX"].flatMap(UUID.init(uuidString:)) ?? UUID()
+            root = manager.temporaryDirectory.appendingPathComponent("AudioTrim-UI-\(token.uuidString)", isDirectory: true)
+            cache = root.appendingPathComponent("Cache", isDirectory: true)
+        } else {
+            root = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("AudioTrim", isDirectory: true)
+            cache = manager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("AudioTrim", isDirectory: true)
+        }
+        library = MediaLibrary(root: root, cache: cache)
+    }
+
+    func boot() async {
+        guard !ready, !booting else { return }
+        booting = true
+        defer { booting = false }
+        if simulated && arguments.contains("-reset") {
+            let folder = root
+            await Task.detached { try? FileManager.default.removeItem(at: folder) }.value
+        }
+        do {
+            state = try await library.open()
+            availableRecords = await library.availableRecords()
+            if simulated && (arguments.contains("-fixture") || arguments.contains("-open-fixture")) {
+                let file = root.appendingPathComponent("fixtures").appendingPathComponent("podcast.wav")
+                try await makeFixture(file)
+                if arguments.contains("-open-fixture") {
+                    receive(file, kind: .audio, displayName: L.t("fixture.name") + ".wav")
+                } else {
+                    _ = try await library.importFile(file, kind: .audio, displayName: L.t("fixture.name") + ".wav")
+                    await refresh()
+                }
+            }
+            if simulated && arguments.contains("-merge-fixture") {
+                let fixtures = root.appendingPathComponent("fixtures")
+                try await makeFixture(fixtures.appendingPathComponent("Opening.wav"), seconds: 3)
+                try await makeFixture(fixtures.appendingPathComponent("Interview.wav"), seconds: 5)
+            }
+            ready = true
+            if simulated && arguments.contains("-code") {
+                if let draft = drafts.first, let source = state.source(for: draft),
+                   let token = ProcessInfo.processInfo.environment["AUDIOTRIM_SELECTION"] {
+                    open(draft)
+                    let value = token == "fixture" ? try SelectionCode(source: source,
+                        range: ClipPreset.both.range(total: source.frames, rate: source.rate) ?? draft.selection)
+                        .token(prefix: L.t("app.name")) : token
+                    importCode(value)
+                }
+            }
+            await recoverRecording()
+            foreground()
+        } catch {
+            unavailable = !ready
+            ready = true
+            failure = MediaIO.map(error, fallback: .data)
+            if unavailable {
+                for item in incoming.flatMap(\.items) where item.access { item.url.stopAccessingSecurityScopedResource() }
+                incoming.removeAll()
+            }
+        }
+    }
+
+    func receive(_ url: URL, kind: SourceKind = .audio, displayName: String? = nil) {
+        receive([url], kind: kind, displayName: displayName)
+    }
+
+    private func incomingItem(_ url: URL, kind: SourceKind, displayName: String? = nil) -> Incoming {
+        Incoming(url: url, kind: kind, displayName: displayName, access: url.startAccessingSecurityScopedResource())
+    }
+
+    private func receive(_ urls: [URL], kind: SourceKind = .audio, displayName: String? = nil,
+                         merge: Bool = false, sharedFolder: URL? = nil) {
+        guard !unavailable, !urls.isEmpty, urls.allSatisfy(\.isFileURL) else { return }
+        incoming.append(ImportBatch(items: urls.map { incomingItem($0, kind: kind, displayName: displayName) },
+                                    merge: merge, sharedFolder: sharedFolder))
+        drain()
+    }
+
+    private func drain() {
+        guard ready, !unavailable, !working, !audio.recording, !preparingRecording, !incoming.isEmpty,
+              activity == nil, failure == nil,
+              panel == nil || panel == .history
+              || panel == .importSelection && incoming.first?.merge == false
+                 && (importingCodeSource || incoming.first?.items.first?.url.pathExtension.lowercased() == "audioclip")
+        else { return }
+        let batch = incoming.removeFirst()
+        working = true
+        flushDraft()
+        operation = Task {
+            defer {
+                working = false
+                drain()
+            }
+            if batch.merge {
+                await importMerge(batch)
+                return
+            }
+            guard let item = batch.items.first else { return }
+            defer { if failedImport == nil { removeSharedBatch(batch) } }
+            do {
+                if item.url.pathExtension.lowercased() == "audioclip" {
+                    let value = try await library.readSelection(item.url, usingAccess: item.access)
+                    acceptCode(value, preferCurrent: false)
+                    return
+                }
+                let ext = item.url.pathExtension
+                let video = UTType(filenameExtension: ext)?.conforms(to: .movie) == true
+                    || UTType(filenameExtension: ext)?.conforms(to: .video) == true
+                let kind: SourceKind = item.kind == .audio && video ? .video : item.kind
+                let imported = try await library.importFile(item.url, kind: kind, displayName: item.displayName, usingAccess: item.access)
+                await refresh()
+                if kind == .recording {
+                    let url = item.url
+                    await Task.detached { try? FileManager.default.removeItem(at: url) }.value
+                }
+                if importingCodeSource, let code {
+                    importingCodeSource = false
+                    codeSource = state.source(for: imported).flatMap { code.matches($0) ? $0 : nil }
+                    if codeSource == nil { failure = .differentSource }
+                    if panel == nil { panel = .importSelection }
+                } else {
+                    open(imported)
+                }
+            } catch {
+                importingCodeSource = false
+                let issue = MediaIO.map(error, fallback: .damaged)
+                if issue == .storage { retainForRetry(batch, failed: item) }
+                failure = issue
+            }
+        }
+    }
+
+    func select(_ picker: Picker, codeSource: Bool = false) {
+        guard picker != .merge || Launch.freePeriod else { return }
+        self.picker = picker
+        importingCodeSource = codeSource
+        if simulated && arguments.contains("-merge-fixture") && picker == .merge {
+            let fixtures = root.appendingPathComponent("fixtures")
+            picked(.success([fixtures.appendingPathComponent("Opening.wav"), fixtures.appendingPathComponent("Interview.wav")]))
+            return
+        }
+        pickerShown = true
+    }
+
+    func picked(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let first = urls.first else { importingCodeSource = false; return }
+            if pickerAllowsMultiple && (picker == .merge || urls.count > 1) {
+                receive(urls, merge: true)
+            } else {
+                receive(first, kind: picker == .video ? .video : .audio)
+            }
+        case .failure(let error):
+            importingCodeSource = false
+            let cocoa = error as NSError
+            if cocoa.domain != NSCocoaErrorDomain || cocoa.code != NSUserCancelledError { failure = .access }
+        }
+    }
+
+    func open(_ item: Draft) {
+        audio.stopPlayback()
+        flushDraft()
+        mergeClips = nil
+        draft = item
+        originalReviewRange = item.selection
+        peaks = nil
+        undo = nil
+        playhead = nil
+        waveTask?.cancel()
+        guard let source = state.source(for: item) else { return }
+        waveTask = Task {
+            let loaded = try? await library.wave(source)
+            if !Task.isCancelled, draft?.id == item.id { peaks = loaded }
+        }
+    }
+
+    func home() {
+        let changed = source.map { asset in
+            guard let draft, let originalReviewRange else { return false }
+            return draft.selection != originalReviewRange && draft.selection.count < asset.frames
+        } ?? false
+        originalReviewRange = nil
+        flushDraft(coreAction: changed)
+        audio.stopPlayback()
+        waveTask?.cancel()
+        draft = nil
+        mergeClips = nil
+        peaks = nil
+        result = nil
+        reviewAfterShareNeedsHome = false
+    }
+
+    private func importMerge(_ request: ImportBatch) async {
+        var batch = request
+        var imported: [(draft: Draft, name: String)] = []
+        var problem: ClipFailure?
+        while !batch.items.isEmpty {
+            let item = batch.items.removeFirst()
+            do {
+                let draft = try await library.importFile(item.url, kind: .audio, usingAccess: item.access)
+                imported.append((draft, item.url.lastPathComponent))
+            } catch {
+                let issue = MediaIO.map(error, fallback: .damaged)
+                if issue == .storage {
+                    batch.items.insert(item, at: 0)
+                    retainForRetry(batch, failed: item)
+                    problem = issue
+                    break
+                }
+                problem = problem ?? issue
+            }
+        }
+        await refresh()
+        if !imported.isEmpty {
+            let sources = Dictionary(uniqueKeysWithValues: state.sources.map { ($0.id, $0) })
+            let clips = imported.compactMap { item in
+                sources[item.draft.sourceID].map { MergeClip(draftID: item.draft.id, source: $0, name: item.name) }
+            }
+            if mergeClips == nil {
+                home()
+                mergeGap = .none
+                mergeClips = []
+            }
+            if panel == .history { panel = nil }
+            mergeClips?.append(contentsOf: clips)
+        }
+        if failedImport == nil { removeSharedBatch(request) }
+        failure = problem
+    }
+
+    private func retainForRetry(_ batch: ImportBatch, failed: Incoming) {
+        var retry = batch
+        retry.items[0] = incomingItem(failed.url, kind: failed.kind, displayName: failed.displayName)
+        failedImport = retry
+    }
+
+    private func removeSharedBatch(_ batch: ImportBatch) {
+        if let folder = batch.sharedFolder { try? FileManager.default.removeItem(at: folder) }
+    }
+
+    func moveMergeClips(from: IndexSet, to: Int) { mergeClips?.move(fromOffsets: from, toOffset: to) }
+
+    func removeMergeClip(_ clip: MergeClip) {
+        if audio.playing == clip.id.uuidString { audio.stopPlayback() }
+        mergeClips?.removeAll { $0.id == clip.id }
+    }
+
+    func preview(_ clip: MergeClip) {
+        Task {
+            do {
+                let url = await library.pcmURL(clip.source)
+                guard mergeClips?.contains(where: { $0.id == clip.id }) == true, !working else { return }
+                try audio.toggle(url, key: clip.id.uuidString)
+            } catch { failure = .playback }
+        }
+    }
+
+    private func refresh() async {
+        let latest = await library.snapshot()
+        state = latest
+        availableRecords = await library.availableRecords()
+    }
+
+    private func update(_ apply: (inout Draft) -> Void) {
+        guard var item = draft else { return }
+        apply(&item)
+        item.updatedAt = Date()
+        draft = item
+        if let index = state.drafts.firstIndex(where: { $0.id == item.id }) { state.drafts[index] = item }
+        saveTask?.cancel()
+        saveTask = Task {
+            do {
+                try await Task.sleep(nanoseconds: 250_000_000)
+                try await library.save(item)
+            } catch is CancellationError {} catch { failure = MediaIO.map(error, fallback: .data) }
+        }
+    }
+
+    func flushDraft(coreAction: Bool = false) {
+        saveTask?.cancel()
+        guard let draft else { return }
+        Task {
+            do {
+                let progress = try await library.save(draft, coreAction: coreAction && !simulated)
+                if let progress { CoreReview.shared.record(progress) }
+            }
+            catch { failure = MediaIO.map(error, fallback: .data) }
+        }
+    }
+
+    func setRange(_ range: FrameRange, preset: ClipPreset? = nil, remember: Bool = true) {
+        guard let source, let draft, range.isValid(total: source.frames, rate: source.rate) else { return }
+        if remember && range != draft.selection { undo = draft.selection }
+        audio.stopPlayback()
+        update { item in
+            item.selection = range
+            item.preset = preset
+        }
+        playhead = nil
+    }
+
+    func captureUndo() { undo = draft?.selection }
+
+    func undoRange() {
+        guard let undo else { return }
+        setRange(undo, remember: false)
+        self.undo = nil
+    }
+
+    func preset(_ value: ClipPreset) {
+        guard let source, let range = value.range(total: source.frames, rate: source.rate) else { return }
+        setRange(range, preset: value)
+    }
+
+    func viewport(zoom: Double, center: Double) {
+        let zoom = min(32, max(1, zoom))
+        let half = 0.5 / zoom
+        update {
+            $0.zoom = zoom
+            $0.center = min(1 - half, max(half, center))
+        }
+    }
+
+    func movePlayhead(_ frame: Int64) { playhead = frame }
+
+    func addCut(_ frame: Int64) -> Bool {
+        guard let draft, let source, draft.cuts.count < 99, !draft.cuts.contains(frame) else { return false }
+        let active = draft.cuts.filter { $0 > draft.selection.start && $0 < draft.selection.end }
+        guard draft.selection.segments(cuts: active + [frame], total: source.frames, rate: source.rate) != nil else { return false }
+        update { $0.cuts.append(frame); $0.cuts.sort() }
+        return true
+    }
+
+    func removeCut(_ frame: Int64) { update { $0.cuts.removeAll { $0 == frame } } }
+
+    func preview(range: FrameRange? = nil) {
+        guard let source, let draft else { return }
+        let selection = range ?? draft.selection
+        let key = range == nil ? "selection" : "segment.\(selection.start).\(selection.end)"
+        Task {
+            do {
+                let url = await library.pcmURL(source)
+                guard self.draft?.id == draft.id, !working, !audio.recording else { return }
+                try audio.toggle(url, key: key,
+                                 start: Double(selection.start) / Double(source.rate),
+                                 end: Double(selection.end) / Double(source.rate))
+            } catch { failure = .playback }
+        }
+    }
+
+    func preview(_ record: ExportRecord) {
+        Task {
+            do {
+                let url = await library.exportURL(record)
+                guard result?.id == record.id, !working, !audio.recording else { return }
+                try audio.toggle(url, key: record.id.uuidString)
+            }
+            catch { failure = .playback }
+        }
+    }
+
+    func startRecording() {
+        guard !working, !preparingRecording, !audio.recording else { return }
+        if microphoneDenied { failure = .microphone; return }
+        preparingRecording = true
+        Task {
+            defer { preparingRecording = false; drain() }
+            let folder = root.appendingPathComponent("Recordings", isDirectory: true)
+            let file = folder.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
+            do {
+                try await Task.detached { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }.value
+                try await audio.startRecording(at: file, simulated: simulated)
+                panel = .recording
+            } catch { failure = MediaIO.map(error, fallback: .recording) }
+        }
+    }
+
+    func stopRecording() {
+        guard let url = audio.stopRecording(simulated: simulated) else { return }
+        panel = nil
+        Task {
+            do {
+                if simulated { try await makeFixture(url, seconds: 2.2) }
+                let title = L.t("recording.name") + " " + Date().formatted(.dateTime.month().day().hour().minute()) + ".wav"
+                receive(url, kind: .recording, displayName: title.replacingOccurrences(of: "/", with: "-"))
+            } catch { failure = .recording }
+        }
+    }
+
+    private func recoverRecording() async {
+        guard !simulated else { return }
+        let folder = root.appendingPathComponent("Recordings", isDirectory: true)
+        let recovered = await Task.detached {
+            let candidates = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+            return candidates.filter { $0.pathExtension == "wav" && RecordingRecovery.isPlayable($0) }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }.value
+        for url in recovered {
+            receive(url, kind: .recording, displayName: L.t("recording.recovered") + ".wav")
+        }
+    }
+
+    func export(_ format: ExportFormat, selected: [Draft]? = nil, segments: [FrameRange]? = nil) {
+        guard !working else { return }
+        let kind: JobKind = selected != nil ? .batch : (segments != nil ? .split : .single)
+        let specs: [ExportSpec]
+        if let selected {
+            guard (1...10).contains(selected.count) else { return }
+            specs = selected.map { ExportSpec(draftID: $0.id, sourceID: $0.sourceID, selection: $0.selection, format: format) }
+        } else if let draft {
+            specs = (segments ?? [draft.selection]).map {
+                ExportSpec(draftID: draft.id, sourceID: draft.sourceID, selection: $0, format: format)
+            }
+        } else { return }
+        performExport {
+            let job = try await self.library.enqueue(specs, kind: kind)
+            try await self.finish(jobID: job.id, kind: kind)
+        }
+    }
+
+    func exportMerge() {
+        guard Launch.freePeriod, let clips = mergeClips, clips.count >= 2, let first = clips.first else { return }
+        let spec = ExportSpec(draftID: first.draftID, sourceID: first.source.id, selection: first.source.audioFrames,
+                              format: .m4a, merge: MergeSpec(sourceIDs: clips.map { $0.source.id }, gap: mergeGap))
+        performExport {
+            let job = try await self.library.enqueue([spec], kind: .merge)
+            try await self.finish(jobID: job.id, kind: job.kind)
+        }
+    }
+
+    func retry(_ job: ExportJob, item: ExportItem? = nil) {
+        performExport { try await self.finish(jobID: job.id, kind: job.kind, itemID: item?.id) }
+    }
+
+    func rebuild(_ record: ExportRecord) {
+        performExport {
+            let value = try await self.library.rebuild(record)
+            await self.refresh()
+            await self.present(value)
+        }
+    }
+
+    private func performExport(_ body: @escaping @MainActor () async throws -> Void) {
+        guard !working else { return }
+        flushDraft()
+        audio.stopPlayback()
+        working = true
+        operation = Task {
+            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "AudioTrim export") { [weak self] in
+                Task { @MainActor in
+                    self?.operation?.cancel()
+                    self?.endBackgroundTask()
+                }
+            }
+            defer {
+                endBackgroundTask()
+                working = false
+                drain()
+            }
+            do { try await body() }
+            catch {
+                await refresh()
+                failure = MediaIO.map(error, fallback: .export)
+            }
+        }
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
+    }
+
+    private func finish(jobID: UUID, kind: JobKind, itemID: UUID? = nil) async throws {
+        let outcome = try await library.run(jobID, only: itemID)
+        await refresh()
+        let pending = state.jobs.first { $0.id == jobID }
+        if (kind == .single || kind == .merge), let item = outcome.records.first {
+            await present(item, milestone: outcome.milestone)
+        } else if pending != nil || outcome.records.isEmpty {
+            show(.tasks)
+            if kind == .single || kind == .merge { failure = pending?.items.first?.failure ?? .paused }
+        } else {
+            if let item = outcome.records.last { await present(item, milestone: outcome.milestone) }
+            notice = L.f("jobs.completed", outcome.records.count)
+        }
+    }
+
+    func present(_ record: ExportRecord, milestone: Milestone? = nil) async {
+        audio.stopPlayback()
+        result = record
+        self.milestone = milestone
+        resultPeaks = nil
+        if record.spec.merge == nil, let asset = resultSource {
+            if asset.id == source?.id, let peaks { resultPeaks = peaks }
+            else { resultPeaks = try? await library.wave(asset) }
+        }
+        show(.result)
+    }
+
+    func shareAudio(_ record: ExportRecord) {
+        audio.stopPlayback()
+        Task {
+            guard await library.available(record) else { failure = .access; return }
+            activity = Activity(url: await library.exportURL(record), countsForReview: true)
+        }
+    }
+
+    func shareCard(_ data: Data) {
+        shareTemporary(data, name: L.t("card.filename") + ".png", countsForReview: true)
+    }
+
+    func recommend() {
+        if let url = ShareArtwork.storeURL {
+            activity = Activity(url: url, countsForReview: false)
+        } else { notice = L.t("card.storePending") }
+    }
+
+    func hideMilestone() { milestone = nil }
+
+    func shareSelection() {
+        guard let draft, let source else { return }
+        do {
+            let data = try SelectionCode(source: source, range: draft.selection).encoded()
+            shareTemporary(data, name: "AudioTrim.audioclip", countsForReview: false)
+        } catch { failure = .badCode }
+    }
+
+    private func shareTemporary(_ data: Data, name: String, countsForReview: Bool) {
+        Task {
+            do {
+                let location = cache.appendingPathComponent("Shared", isDirectory: true).appendingPathComponent(name)
+                try await Task.detached {
+                    try FileManager.default.createDirectory(at: location.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try data.write(to: location, options: .atomic)
+                }.value
+                activity = Activity(url: location, countsForReview: countsForReview)
+            } catch { failure = MediaIO.map(error, fallback: .storage) }
+        }
+    }
+
+    func copyCode() {
+        guard let draft, let source else { return }
+        do {
+            let value = try SelectionCode(source: source, range: draft.selection).token(prefix: L.t("app.name"))
+            UIPasteboard.general.string = L.t("code.instructions") + "\n" + value
+            notice = L.t("code.copied")
+        } catch { failure = .badCode }
+    }
+
+    func importCode(_ text: String) {
+        do { acceptCode(try SelectionCode.decode(token: text), preferCurrent: true) }
+        catch { failure = .badCode }
+    }
+
+    private func acceptCode(_ value: SelectionCode, preferCurrent: Bool) {
+        code = value
+        if preferCurrent, let source {
+            codeSource = value.matches(source) ? source : nil
+            if codeSource == nil { failure = .differentSource }
+        } else {
+            codeSource = state.sources.first { value.matches($0) }
+        }
+        show(.importSelection)
+    }
+
+    func clearCode() { code = nil; codeSource = nil }
+
+    func applyCode() {
+        guard let code, let source = codeSource, !working else { return }
+        let priorDraft = draft
+        working = true
+        Task {
+            defer { working = false; drain() }
+            do {
+                let copy = try await library.apply(code, to: source.id)
+                await refresh()
+                open(copy)
+                undo = priorDraft?.sourceID == source.id ? priorDraft?.selection : source.audioFrames
+                clearCode()
+                panel = nil
+            } catch { failure = MediaIO.map(error, fallback: .badCode) }
+        }
+    }
+
+    func loadStorage() async {
+        var sizes: [UUID: Int64] = [:]
+        for source in state.sources { sizes[source.id] = await library.sourceBytes(source) }
+        sourceSizes = sizes
+    }
+
+    func delete(_ record: ExportRecord) {
+        audio.stopPlayback()
+        Task {
+            do { try await library.deleteFile(record); await refresh() }
+            catch { failure = MediaIO.map(error, fallback: .data) }
+        }
+    }
+
+    func delete(_ item: Draft) {
+        audio.stopPlayback()
+        Task {
+            do {
+                try await library.deleteDraft(item)
+                if draft?.id == item.id { home() }
+                await refresh()
+                await loadStorage()
+            } catch { failure = MediaIO.map(error, fallback: .data) }
+        }
+    }
+
+    func show(_ target: Panel) {
+        if target == panel { return }
+        if panel != nil {
+            nextPanel = target
+            panel = nil
+        } else { panel = target }
+    }
+
+    func dismissed() {
+        if let next = nextPanel {
+            nextPanel = nil
+            panel = next
+        } else {
+            if draft == nil { reviewAfterShareNeedsHome = false }
+            audio.stopPlayback()
+            drain()
+        }
+    }
+
+    func activityEnded(countsForReview: Bool) {
+        if countsForReview {
+            reviewAfterShareNeedsHome = true
+            reviewEarliest = Date().addingTimeInterval(20)
+            Task { try? await library.shared() }
+        }
+        activity = nil
+        drain()
+    }
+
+    func failureDismissed() {
+        if let failedImport {
+            for item in failedImport.items where item.access { item.url.stopAccessingSecurityScopedResource() }
+            self.failedImport = nil
+        }
+        failure = nil
+        drain()
+    }
+
+    var canRetryImport: Bool { failedImport != nil }
+
+    func retryImport() {
+        guard let batch = failedImport else { return }
+        failedImport = nil
+        failure = nil
+        incoming.insert(batch, at: 0)
+        drain()
+    }
+
+    func foreground() {
+        if !simulated, !unavailable {
+            for (folder, urls) in ShareInbox.pending() where Launch.freePeriod || urls.count == 1 {
+                if queuedShares.insert(folder).inserted {
+                    receive(urls, merge: urls.count > 1, sharedFolder: folder)
+                }
+            }
+        }
+        drain()
+    }
+
+    var reviewVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1" }
+    var reviewedThisVersion: Bool { state.progress.reviewedVersions.contains(reviewVersion) }
+
+    func considerReview(_ request: () -> Void) async -> Bool {
+        let now = Date()
+        guard !simulated, idleHome, !reviewAfterShareNeedsHome, now >= reviewEarliest,
+              state.progress.eligibleForReview(at: now, version: reviewVersion),
+              CoreReview.shared.attempt(request) else { return false }
+        await markReviewRequested(at: now)
+        return true
+    }
+
+    func markReviewRequested(at date: Date = Date()) async {
+        try? await library.markReviewRequested(at: date, version: reviewVersion)
+        await refresh()
+    }
+
+    func stopForInterruption() {
+        audio.sessionInterrupted(true)
+        if audio.recording { stopRecording() }
+    }
+
+    private func makeFixture(_ url: URL, seconds: Double = 48.2) async throws {
+        try await Task.detached { try MediaFixture.make(url, seconds: seconds) }.value
+    }
+}

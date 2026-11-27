@@ -1,0 +1,235 @@
+import AVFoundation
+import Foundation
+import XCTest
+
+final class CoreTests: XCTestCase {
+    private let rate = 48000
+
+    private func media(hash: String = String(repeating: "a", count: 64)) -> SourceAsset {
+        SourceAsset(id: UUID(), originalName: "sample.wav", storedName: "original.wav", kind: .audio,
+                    hash: hash, trackIndex: 0, rate: rate, channels: 1, frames: 48 * Int64(rate), bytes: 500)
+    }
+
+    func testPresetsUseSourceAndHandleShortFiles() {
+        let total: Int64 = 2_313_600
+        let range = ClipPreset.both.range(total: total, rate: rate)
+        XCTAssertEqual(range, FrameRange(start: 48_000, end: 2_265_600))
+        XCTAssertEqual(ClipPreset.both.range(total: total, rate: rate), range)
+        XCTAssertEqual(ClipPreset.head.range(total: total, rate: rate)?.start, 48_000)
+        XCTAssertNil(ClipPreset.both.range(total: 96_000, rate: rate))
+        XCTAssertNil(ClipPreset.both.range(total: 100_799, rate: rate))
+        XCTAssertNotNil(ClipPreset.both.range(total: 100_800, rate: rate))
+        XCTAssertNil(ClipPreset.head.range(total: 3, rate: rate))
+        XCTAssertEqual(ClipPreset.all.range(total: 3, rate: rate), .init(start: 0, end: 3))
+    }
+
+    func testTimeRangeAndCuts() {
+        XCTAssertEqual(ClipClock.parse("01:02:03.45", rate: rate), 178_725_600)
+        XCTAssertEqual(ClipClock.parse("01:01,25", rate: rate), 2_940_000)
+        for value in ["-1", "00:60", "1:60:01", "1e9", "NaN", "::1", "0.0.1", "9999999999999999999"] {
+            XCTAssertNil(ClipClock.parse(value, rate: rate), value)
+        }
+        let range = FrameRange(start: 0, end: 48_000)
+        XCTAssertEqual(range.movingStart(90_000, total: 48_000, rate: rate).start, 43_200)
+        XCTAssertEqual(range.movingEnd(-1, total: 48_000, rate: rate).end, 4_800)
+        XCTAssertEqual(range.segments(cuts: [36_000, 12_000, 12_000], total: 48_000, rate: rate)?.map(\.count),
+                       [12_000, 24_000, 12_000])
+        XCTAssertNil(range.segments(cuts: [12_000, 13_000], total: 48_000, rate: rate))
+        XCTAssertFalse(FrameRange(start: 5000, end: 4999).isValid(total: 48_000, rate: rate))
+    }
+
+    func testWaveAndSelectionTokenValidation() throws {
+        let peaks = WavePeaks(framesPerPeak: 10, peaks: Array(repeating: 0, count: 100) + Array(repeating: 32768, count: 100))
+        let whole = peaks.values(in: .init(start: 0, end: 2000), bars: 2)
+        XCTAssertEqual(whole, [0, 1])
+        XCTAssertTrue(peaks.values(in: .init(start: 1100, end: 1700), bars: 7).allSatisfy { $0 == 1 })
+        let source = media()
+        let code = SelectionCode(source: source, range: FrameRange(start: 48_000, end: 96_000))
+        let token = try code.token(prefix: "AudioTrim")
+        XCTAssertEqual(try SelectionCode.decode(token: "Instructions\n" + token), code)
+        XCTAssertEqual(try SelectionCode.decode(data: code.encoded()), code)
+        XCTAssertTrue(code.matches(source))
+        XCTAssertFalse(code.matches(media(hash: String(repeating: "b", count: 64))))
+        XCTAssertThrowsError(try SelectionCode.decode(token: token + String(repeating: "x", count: 2048)))
+        XCTAssertThrowsError(try SelectionCode.decode(token: "AC1:+=="))
+        var future = code
+        future.version = 2
+        XCTAssertThrowsError(try SelectionCode.decode(data: future.encoded()))
+        future.version = 1
+        future.end = Int64.max
+        XCTAssertThrowsError(try SelectionCode.decode(data: future.encoded()))
+    }
+
+    func testInstalledAppEnablesAllFeatures() {
+        XCTAssertTrue(Launch.freePeriod)
+    }
+
+    func testCoreReviewRequiresThreeActionsOnTwoLocalDates() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Asia/Tokyo"))
+        let firstDay = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 11, day: 23, hour: 23)))
+        let nextDay = firstDay.addingTimeInterval(2 * 3600)
+        let empty = try JSONDecoder().decode(CoreReviewProgress.self, from: Data("{}".utf8))
+        XCTAssertFalse(empty.isEligible)
+        var progress = CoreReviewProgress.recording(empty, at: firstDay, calendar: calendar)
+        var twoDays = progress
+        twoDays.record(at: nextDay, calendar: calendar)
+        XCTAssertFalse(twoDays.isEligible)
+        progress.record(at: firstDay, calendar: calendar)
+        XCTAssertFalse(progress.isEligible)
+
+        var sameDay = progress
+        sameDay.record(at: firstDay, calendar: calendar)
+        XCTAssertFalse(sameDay.isEligible)
+
+        let data = try JSONEncoder().encode(progress)
+        progress = try JSONDecoder().decode(CoreReviewProgress.self, from: data)
+        progress.record(at: nextDay, calendar: calendar)
+        XCTAssertTrue(progress.isEligible)
+    }
+
+    func testMilestonesAndReviewDeduplicate() {
+        var progress = SharingProgress()
+        let calendar = Calendar(identifier: .gregorian)
+        let current = Date(timeIntervalSince1970: 1_700_000_000)
+        let next = current.addingTimeInterval(86400)
+        var spec = ExportSpec(draftID: UUID(), sourceID: UUID(), selection: .init(start: 0, end: 96_000), format: .m4a)
+        for number in 1...5 {
+            let source = media(hash: String(repeating: String(number), count: 64))
+            spec.sourceID = source.id
+            let milestone = progress.record(source: source, spec: spec, single: true,
+                                            date: number < 3 ? current : next, calendar: calendar)
+            XCTAssertEqual(milestone, number == 5 ? Milestone(count: 5, seconds: 10) : nil)
+            XCTAssertNil(progress.record(source: source, spec: spec, single: false, date: next, calendar: calendar))
+        }
+        XCTAssertFalse(progress.claimReview(at: next, version: "1"))
+        progress.completedShare()
+        XCTAssertTrue(progress.claimReview(at: next, version: "1"))
+        XCTAssertFalse(progress.claimReview(at: next.addingTimeInterval(121 * 86400), version: "1"))
+        XCTAssertFalse(progress.claimReview(at: next.addingTimeInterval(119 * 86400), version: "2"))
+        XCTAssertTrue(progress.claimReview(at: next.addingTimeInterval(120 * 86400), version: "2"))
+    }
+
+    func testExactWAVAndAACAndLibraryRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("Original.wav")
+        try MediaFixture.make(url, seconds: 3.3)
+        let reference = try Data(contentsOf: url)
+        let path = root.appendingPathComponent("library")
+        let cache = root.appendingPathComponent("cache")
+        let library = MediaLibrary(root: path, cache: cache)
+        _ = try await library.open()
+        var draft = try await library.importFile(url, kind: .audio)
+        let snapshot = await library.snapshot()
+        let source = try XCTUnwrap(snapshot.source(for: draft))
+        XCTAssertEqual(source.frames, 158_400)
+        let range = FrameRange(start: 48_003, end: 106_499)
+        draft.selection = range
+        try await library.save(draft)
+        let duplicate = try await library.importFile(url, kind: .audio)
+        XCTAssertEqual(duplicate.id, draft.id)
+        XCTAssertEqual(duplicate.selection, range)
+        let specs = [ExportFormat.wav, .m4a].map {
+            ExportSpec(draftID: draft.id, sourceID: source.id, selection: range, format: $0)
+        }
+        let queue = try await library.enqueue(specs, kind: .batch)
+        let reopened = MediaLibrary(root: path, cache: cache)
+        let restored = try await reopened.open()
+        XCTAssertEqual(restored.drafts.first?.selection, range)
+        XCTAssertEqual(restored.jobs.first?.items.map(\.spec), specs)
+        let finished = try await reopened.run(queue.id)
+        XCTAssertEqual(finished.records.count, 2)
+        for record in finished.records {
+            let output = await reopened.exportURL(record)
+            let file = try AVAudioFile(forReading: output, commonFormat: .pcmFormatInt16, interleaved: true)
+            if record.spec.format == .wav {
+                XCTAssertEqual(file.length, range.count)
+                let input = try AVAudioFile(forReading: url, commonFormat: .pcmFormatInt16, interleaved: true)
+                input.framePosition = range.start
+                let expected = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: input.processingFormat, frameCapacity: 2))
+                let actual = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 2))
+                try input.read(into: expected)
+                try file.read(into: actual)
+                XCTAssertEqual(actual.int16ChannelData?.pointee[0], expected.int16ChannelData?.pointee[0])
+                XCTAssertEqual(actual.int16ChannelData?.pointee[1], expected.int16ChannelData?.pointee[1])
+            } else {
+                XCTAssertEqual(Double(file.length) / file.fileFormat.sampleRate, Double(range.count) / 48000, accuracy: 0.03)
+            }
+            try await reopened.deleteFile(record)
+            let rebuilt = try await reopened.rebuild(record)
+            XCTAssertEqual(rebuilt.id, record.id)
+            XCTAssertEqual(rebuilt.spec, record.spec)
+        }
+        XCTAssertEqual(reference, try Data(contentsOf: url))
+    }
+
+    func testMergesOneSecondClipsWithEachGap() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstURL = root.appendingPathComponent("First.wav")
+        let secondURL = root.appendingPathComponent("Second.wav")
+        try MediaFixture.make(firstURL, seconds: 1)
+        try MediaFixture.make(secondURL, seconds: 1, rate: 44100)
+        let library = MediaLibrary(root: root.appendingPathComponent("Library"), cache: root.appendingPathComponent("Cache"))
+        _ = try await library.open()
+        let first = try await library.importFile(firstURL, kind: .audio)
+        let second = try await library.importFile(secondURL, kind: .audio)
+        let state = await library.snapshot()
+        let source = try XCTUnwrap(state.source(for: first))
+
+        for gap in MergeGap.allCases {
+            let merge = MergeSpec(sourceIDs: [first.sourceID, second.sourceID], gap: gap)
+            let spec = ExportSpec(draftID: first.id, sourceID: source.id, selection: source.audioFrames,
+                                  format: .m4a, merge: merge)
+            let job = try await library.enqueue([spec], kind: .merge)
+            let outcome = try await library.run(job.id)
+            XCTAssertEqual(outcome.records.count, 1)
+            let record = try XCTUnwrap(outcome.records.first)
+            XCTAssertEqual(record.spec.merge, merge)
+            let output = await library.exportURL(record)
+            XCTAssertEqual(output.pathExtension, "m4a")
+            let file = try AVAudioFile(forReading: output)
+            XCTAssertEqual(Double(file.length) / file.fileFormat.sampleRate, 2 + gap.seconds, accuracy: 0.06)
+            if gap == .one {
+                try await library.deleteDraft(second)
+                try await library.deleteFile(record)
+                let rebuilt = try await library.rebuild(record)
+                XCTAssertEqual(rebuilt.spec, record.spec)
+                XCTAssertEqual(rebuilt.seconds, 3, accuracy: 0.06)
+            }
+        }
+    }
+
+    func testVideoAudioTrackAndMP3Resampling() async throws {
+        let fixtures = Bundle(for: Self.self)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = MediaLibrary(root: root, cache: root.appendingPathComponent("Cache"))
+        _ = try await library.open()
+        let movie = try XCTUnwrap(fixtures.url(forResource: "routes", withExtension: "mp4"))
+        let videoDraft = try await library.importFile(movie, kind: .video)
+        let videoState = await library.snapshot()
+        let track = try XCTUnwrap(videoState.source(for: videoDraft))
+        XCTAssertEqual(track.trackIndex, 0)
+        XCTAssertEqual(track.rate, 44100)
+        XCTAssertEqual(track.channels, 1)
+        XCTAssertEqual(Double(track.frames) / Double(track.rate), 1, accuracy: 0.10)
+        let mp3 = try XCTUnwrap(fixtures.url(forResource: "short-stereo", withExtension: "mp3"))
+        let audioDraft = try await library.importFile(mp3, kind: .audio)
+        let audioState = await library.snapshot()
+        let audio = try XCTUnwrap(audioState.source(for: audioDraft))
+        XCTAssertEqual(audio.rate, 48000)
+        XCTAssertEqual(audio.channels, 2)
+        XCTAssertEqual(Double(audio.frames) / Double(audio.rate), 0.7, accuracy: 0.08)
+        let silent = try XCTUnwrap(fixtures.url(forResource: "silent", withExtension: "mov"))
+        do {
+            _ = try await library.importFile(silent, kind: .video)
+            XCTFail("A video without audio must not create a draft")
+        } catch let failure as ClipFailure {
+            XCTAssertEqual(failure, .noAudio)
+        }
+        let final = await library.snapshot()
+        XCTAssertEqual(final.drafts.count, 2)
+    }
+}
